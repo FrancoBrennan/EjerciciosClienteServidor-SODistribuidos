@@ -1,187 +1,203 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <sys/ipc.h>
-#include <sys/shm.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <sys/types.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <unistd.h>
 #include <pthread.h>
 #include <semaphore.h>
 
-#define PORT 8080
-#define SHM_KEY 0xa
-#define SHM_SIZE 512
-#define PAGE_SIZE 32
-#define NUM_PAGES (SHM_SIZE / PAGE_SIZE)
+#define IP "127.0.0.1"
+#define TAMPAGINA 32
+#define LONGMENSAJE 8 * 1024
+#define MAX_PAG 10
 
-typedef struct {
-    char data[256];
-    int occupied;
-    sem_t sem; // Semaphore for each memory page
-} SharedString;
+typedef struct
+{
+    char contenido[TAMPAGINA];
+    sem_t semaforo;
+} Pagina;
 
-SharedString *shared_memory;
+Pagina paginas[MAX_PAG];
 
-void show_shared_memory_table() {
-    printf("Shared Memory Table:\n");
-    for (int i = 0; i < NUM_PAGES; i++) {
-        printf("Position %d - Occupied: %d - Data: %s\n", i, shared_memory[i].occupied, shared_memory[i].data);
+void *atender_cliente(void *);
+void init_memoria_semaforos();
+void imprime_info_paginas();
+
+int main(int argc, char *argv[])
+{
+    socklen_t addrlen;
+    int idsocks, idsockc;
+    struct sockaddr_in addr_in, addrcli_in;
+    pthread_t thread_id;
+
+    idsocks = socket(AF_INET, SOCK_STREAM, 0);
+
+    printf("idsocks %d\n", idsocks);
+
+    int puerto = atoi(argv[1]);
+
+    addr_in.sin_family = AF_INET;
+    addr_in.sin_port = htons(puerto);
+    addr_in.sin_addr.s_addr = inet_addr(IP);
+    memset(addr_in.sin_zero, 0, sizeof(addr_in.sin_zero));
+
+    addrlen = sizeof(addr_in);
+    printf("bind %d\n", bind(idsocks, (struct sockaddr *)&addr_in, addrlen));
+    printf("listen %d\n", listen(idsocks, 5));
+
+    init_memoria_semaforos();
+
+    while (1)
+    {
+        printf("Servidor en puerto %d esperando conexion de cliente... \n", puerto);
+
+        imprime_info_paginas();
+
+        idsockc = accept(idsocks, (struct sockaddr *)&addrcli_in, &addrlen);
+        if (idsockc == -1)
+        {
+            printf("Conexion rechazada - isocks <= 0 : %d \n", idsockc);
+        }
+
+        printf("Conexion aceptada desde el cliente %d \n", idsockc);
+
+        int *arg = malloc(sizeof(*arg));
+        *arg = idsockc;
+        if (pthread_create(&thread_id, NULL, atender_cliente, arg) != 0)
+        {
+            perror("pthread_create");
+        }
+        else
+        {
+            pthread_detach(thread_id);
+        }
+    }
+
+    exit(0);
+}
+
+void init_memoria_semaforos()
+{
+    for (int i = 0; i < MAX_PAG; i++)
+    {
+        memset(paginas[i].contenido, '-', TAMPAGINA);
+        sem_init(&paginas[i].semaforo, 0, 1);
     }
 }
 
-void *handle_client(void *client_socket) {
-    int new_socket = *((int *)client_socket);
-    free(client_socket);
+void *atender_cliente(void *idsockcli)
+{
+    int idsockc = *((int *)idsockcli);
+    free(idsockcli);
 
-    char buffer[1024] = {0};
-    int valread = read(new_socket, buffer, 1024);
-    printf("Received: %s\n", buffer);
+    char buff[LONGMENSAJE];
+    char opt;
 
-    // Parse command
-    char command[20];
-    int index;
-    char value[256];
-    sscanf(buffer, "%s %d %[^\n]", command, &index, value);
+    while (1)
+    {
+        memset(buff, '\0', LONGMENSAJE);
+        int nb = recv(idsockc, buff, LONGMENSAJE, 0);
+        if (nb <= 0)
+        {
+            perror("recv");
+            break;
+        }
+        buff[nb] = '\0';
+        opt = buff[0];
 
-    if (index < 0 || index >= NUM_PAGES) {
-        char *response = "Index out of bounds\n";
-        send(new_socket, response, strlen(response), 0);
-    } else if (strcmp(command, "write") == 0) {
-        if (sem_trywait(&shared_memory[index].sem) == 0) {
-            strcpy(shared_memory[index].data, value);
-            shared_memory[index].occupied = 1;
-            sem_post(&shared_memory[index].sem);
-            char *response = "Write successful\n";
-            send(new_socket, response, strlen(response), 0);
-        } else {
-            char *response = "Position is currently in use, try again later\n";
-            send(new_socket, response, strlen(response), 0);
+        printf("cliente %d dice -> %s\n", idsockc, buff);
+
+        if (opt == '1')
+        {
+            int pagina = buff[1] - '0';
+            if (pagina >= 0 && pagina < MAX_PAG)
+            {
+                if (sem_trywait(&paginas[pagina].semaforo) == 0)
+                {
+                    strncpy(buff, paginas[pagina].contenido, TAMPAGINA);
+                    sem_post(&paginas[pagina].semaforo);
+                }
+                else
+                {
+                    strcpy(buff, "Pagina en uso, intentelo mas tarde\n");
+                }
+            }
+            else
+            {
+                strcpy(buff, "Pagina invalida\n");
+            }
+
+            imprime_info_paginas();
         }
-    } else if (strcmp(command, "read") == 0) {
-        sem_wait(&shared_memory[index].sem);  // Lock the semaphore
-        if (shared_memory[index].occupied) {
-            char read_value[256];
-            strcpy(read_value, shared_memory[index].data);
-            sem_post(&shared_memory[index].sem);  // Unlock the semaphore
-            char response[300];
-            sprintf(response, "Value at index %d: %s\n", index, read_value);
-            send(new_socket, response, strlen(response), 0);
-        } else {
-            sem_post(&shared_memory[index].sem);  // Unlock the semaphore
-            char *response = "Position not occupied\n";
-            send(new_socket, response, strlen(response), 0);
+        else if (opt == '2')
+        {
+            int pagina = buff[1] - '0';
+            if (pagina >= 0 && pagina < MAX_PAG)
+            {
+                if (sem_trywait(&paginas[pagina].semaforo) == 0)
+                {
+                    buff[nb] = '\0';
+                    strcpy(buff, "Pagina disponible para uso\n");
+                    send(idsockc, buff, strlen(buff), 0);
+
+                    nb = recv(idsockc, buff, LONGMENSAJE, 0);
+                    if (nb > 0)
+                    {
+                        buff[nb] = '\0';
+                        printf("Cliente %d dice -> %s\n", idsockc, buff);
+                        strncpy(paginas[pagina].contenido, buff, TAMPAGINA);
+
+                        sem_post(&paginas[pagina].semaforo);
+
+                        strcpy(buff, "Actualizacion exitosa! \n");
+                        send(idsockc, buff, strlen(buff), 0);
+
+                        imprime_info_paginas();
+                    }
+                    else
+                    {
+                        perror("recv");
+                        strcpy(buff, "Error al recibir contenido\n");
+                    }
+                }
+                else
+                {
+                    strcpy(buff, "Pagina en uso, intentelo mas tarde\n");
+                }
+            }
+            else
+            {
+                strcpy(buff, "Pagina invalida \n");
+            }
         }
-    } else if (strcmp(command, "request") == 0) {
-        if (sem_trywait(&shared_memory[index].sem) == 0) {
-            char *response = "Page successfully acquired\n";
-            send(new_socket, response, strlen(response), 0);
-        } else {
-            char *response = "Page is currently in use, try again later\n";
-            send(new_socket, response, strlen(response), 0);
+        else if (opt == '9')
+        {
+            strcpy(buff, "Desconectando\n");
+            send(idsockc, buff, strlen(buff), 0);
+            break;
         }
-    } else if (strcmp(command, "release") == 0) {
-        sem_post(&shared_memory[index].sem);
-        char *response = "Page released\n";
-        send(new_socket, response, strlen(response), 0);
-    } else if (strcmp(command, "show_table") == 0) {
-        show_shared_memory_table();
-    } else {
-        char *response = "Invalid command\n";
-        send(new_socket, response, strlen(response), 0);
+        else
+        {
+            strcpy(buff, "Opcion invalida\n");
+        }
+
+        send(idsockc, buff, strlen(buff), 0);
     }
 
-    // Mostrar la tabla después de cada comando
-    show_shared_memory_table();
-
-    close(new_socket);
+    close(idsockc);
     pthread_exit(NULL);
 }
 
-int main(int argc, char *argv[]) {
-    const char *ip_address = "127.0.0.1";
-    int server_fd, new_socket;
-    struct sockaddr_in address;
-    int opt = 1;
-    int addrlen = sizeof(address);
-
-    // Create shared memory
-    int shmid = shmget(SHM_KEY, SHM_SIZE * sizeof(SharedString), IPC_CREAT | IPC_EXCL | 0600);
-    if (shmid < 0) {
-        perror("shmget");
-        exit(EXIT_FAILURE);
+void imprime_info_paginas()
+{
+    printf("Contenido de todas las paginas:\n");
+    for (int i = 0; i < MAX_PAG; i++)
+    {
+        printf("Pagina %d: %.*s\n", i, TAMPAGINA, paginas[i].contenido);
     }
-
-    shared_memory = (SharedString *)shmat(shmid, NULL, 0);
-    if (shared_memory == (void *)-1) {
-        perror("shmat");
-        exit(EXIT_FAILURE);
-    }
-
-    // Initialize shared memory and semaphores
-    for (int i = 0; i < NUM_PAGES; i++) {
-        shared_memory[i].occupied = 0;
-        sem_init(&shared_memory[i].sem, 1, 1);  // Initialize the semaphore for each page
-    }
-
-    // Create socket file descriptor
-    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
-        perror("socket failed");
-        exit(EXIT_FAILURE);
-    }
-
-    // Attach socket to the port
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
-        perror("setsockopt");
-        close(server_fd);
-        exit(EXIT_FAILURE);
-    }
-
-    address.sin_family = AF_INET;
-    if (inet_pton(AF_INET, ip_address, &address.sin_addr) <= 0) {
-        perror("Invalid address/ Address not supported");
-        close(server_fd);
-        exit(EXIT_FAILURE);
-    }
-    address.sin_port = htons(PORT);
-
-    // Bind the socket to the port
-    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
-        perror("bind failed");
-        close(server_fd);
-        exit(EXIT_FAILURE);
-    }
-
-    // Start listening for connections
-    if (listen(server_fd, 3) < 0) {
-        perror("listen");
-        close(server_fd);
-        exit(EXIT_FAILURE);
-    }
-
-    printf("Server listening on IP %s, port %d\n", ip_address, PORT);
-
-    while (1) {
-        if ((new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t *)&addrlen)) < 0) {
-            perror("accept");
-            continue;
-        }
-
-        pthread_t thread_id;
-        int *client_socket = malloc(sizeof(int));
-        *client_socket = new_socket;
-        pthread_create(&thread_id, NULL, handle_client, (void *)client_socket);
-        pthread_detach(thread_id);
-    }
-
-    // Liberar recursos
-    for (int i = 0; i < NUM_PAGES; i++) {
-        sem_destroy(&shared_memory[i].sem);  // Destruir los semáforos
-    }
-    shmdt(shared_memory);
-    close(server_fd);
-    return 0;
 }
-
-

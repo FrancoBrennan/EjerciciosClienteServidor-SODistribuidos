@@ -1,220 +1,263 @@
-#include <stdio.h>       
+#include <stdio.h>
 #include <stdlib.h>
-#include <pthread.h>      
-#include <unistd.h>   
-#include <string.h>   
-#include <fcntl.h>   
+#include <pthread.h>
+#include <unistd.h>
+#include <string.h>
 #include <sys/types.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-#define LONGMENSAJE 8*1024
+#define PUERTO 8888
+#define MAX_BUFFER 1024
 
-void *atender(void *);
+// Función que maneja la conexión con cada cliente en un hilo separado
+void *atender(void *arg);
 
-void armarMensajeDirectorio(char *);
-void armarMensajeContenidoArchivo(char *);
-void armarMensajeCierreConexion(char *);
-void borrarArchivo(char *);
-void modificarArchivo(char *, int);
-void agregarArchivo(char *);
-
-int main(int argc, char * argv[]) {
-    if (argc != 3) {
-        printf("sintaxis error ingrese ./comando ip puerto\n");
-        exit(-1);
+int main(int argc, char *argv[]) {
+    if (argc != 2) {
+        fprintf(stderr, "Uso: %s <IP>\n", argv[0]);
+        exit(EXIT_FAILURE);
     }
 
-    socklen_t addrlen;
     int sockfd;
     struct sockaddr_in addr_in, addrcli_in;
-    sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    printf("socket = %d\n", sockfd);
 
-    //completar la estrutura addr_in 
+    // Crear un socket TCP/IP
+    if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        perror("Error al crear el socket");
+        exit(EXIT_FAILURE);
+    }
+
+    // Configurar la dirección del servidor
     addr_in.sin_family = AF_INET;
-    addr_in.sin_port = htons(atoi(argv[2]));
+    addr_in.sin_port = htons(PUERTO);
     addr_in.sin_addr.s_addr = inet_addr(argv[1]);
-    memset(addr_in.sin_zero, 0, 8);
+    memset(addr_in.sin_zero, 0, sizeof(addr_in.sin_zero));
 
-    addrlen = sizeof(addr_in);
-    int bn = bind(sockfd, (struct sockaddr *)&addr_in, addrlen);
-    printf("bind = %d\n", bn);
+    // Enlazar el socket a la dirección y puerto especificados
+    if (bind(sockfd, (struct sockaddr *)&addr_in, sizeof(addr_in)) < 0) {
+        perror("Error en bind");
+        close(sockfd);
+        exit(EXIT_FAILURE);
+    }
 
-    int lst = listen(sockfd, 5);
-    printf("listen = %d\n", lst);
+    // Escuchar conexiones entrantes, con una cola de hasta 5 conexiones
+    if (listen(sockfd, 5) < 0) {
+        perror("Error en listen");
+        close(sockfd);
+        exit(EXIT_FAILURE);
+    }
+
+    printf("Servidor en puerto %d esperando conexión del cliente\n", PUERTO);
+    
+    socklen_t addrlen = sizeof(addrcli_in);
+    while (1) {
+        // Aceptar una nueva conexión entrante
+        int sockclifd = accept(sockfd, (struct sockaddr *)&addrcli_in, &addrlen);
+        if (sockclifd >= 0) {
+            // Crear un nuevo hilo para manejar la conexión con el cliente
+            pthread_t hilo;
+            int *pclient = malloc(sizeof(int));
+            *pclient = sockclifd;
+            pthread_create(&hilo, NULL, atender, pclient);
+            pthread_detach(hilo);  // Separar el hilo para que se maneje independientemente
+        } else {
+            perror("Error en accept");
+        }
+    }
+
+    close(sockfd);
+    return 0;
+}
+
+// Función que se ejecuta en cada hilo para manejar las solicitudes del cliente
+void *atender(void *arg) {
+    int sockclifd = *((int *)arg);
+    free(arg);
+    char buffer[MAX_BUFFER];
+    memset(buffer, 0, sizeof(buffer));
 
     while (1) {
-        printf("servidor en puerto %s esperando conexion del cliente\n", argv[2]);
-        int *sockclifd = malloc(sizeof(int));
-        *sockclifd = accept(sockfd, (struct sockaddr *)&addrcli_in, &addrlen);
-        if (*sockclifd > 0) {
-            pthread_t hilo;
-            pthread_create(&hilo, NULL, atender, (void *)sockclifd);
-        }
-    }
-}
+        // Recibir solicitud del cliente
+        int nb = recv(sockclifd, buffer, sizeof(buffer) - 1, 0);
+        if (nb > 0) {
+            buffer[nb] = '\0';  // Terminar la cadena recibida
+            printf("Solicitud del cliente: %s\n", buffer);
 
-void *atender(void *sockclifd) {
-    printf("sockclifd = %d\n", *((int *)sockclifd));
-    int sockcli = *((int *)sockclifd);
-    char mensaje[LONGMENSAJE];
-    char opcion;
-    do {
-        memset(mensaje, '\0', LONGMENSAJE);
-        int nb = recv(sockcli, mensaje, LONGMENSAJE, 0);
-        mensaje[nb] = '\0';
-        opcion = mensaje[0];
-        printf("cliente dice -> %s\n", mensaje);
-        if (opcion == '1') //el cliente pide directorio 
-            armarMensajeDirectorio(mensaje);
-        if (opcion == '2') //el cliente pide un archivo
-            armarMensajeContenidoArchivo(mensaje);
-        if (opcion == '3') // El cliente pide borrar un archivo
-            borrarArchivo(mensaje);
-        if (opcion == '4') // El cliente pide modificar un archivo
-            modificarArchivo(mensaje, sockcli);
-        if (opcion == '5') // El cliente pide agregar un archivo
-            agregarArchivo(mensaje);
-        if (opcion == '0') // cliente pide cerrar conexion
-            armarMensajeCierreConexion(mensaje);
-        send(sockcli, mensaje, strlen(mensaje), 0);
-    } while (opcion != '0');
-    close(sockcli);
-    free(sockclifd);
-    pthread_exit(NULL);
-}
+            if (buffer[0] == '1') {
+                // Enviar listado del directorio actual al cliente
+                DIR *dir = opendir(".");
+                if (dir != NULL) {
+                    struct dirent *midirent;
+                    struct stat mistat;
+                    while ((midirent = readdir(dir)) != NULL) {
+                        if (stat(midirent->d_name, &mistat) == 0) {
+                            snprintf(buffer, sizeof(buffer), "%s %ld\n", midirent->d_name, mistat.st_size);
+                            send(sockclifd, buffer, strlen(buffer), 0);
+                        }
+                    }
+                    closedir(dir);
+                } else {
+                    perror("Error al abrir el directorio");
+                }
+                strcpy(buffer, "\nEND\n");  // Indicar el fin del listado
+                send(sockclifd, buffer, strlen(buffer), 0);
+            } else if (buffer[0] == '2') {
+                // Enviar contenido de un archivo al cliente
+                char *filename = buffer + 1;
+                filename[strcspn(filename, "\n")] = '\0';  // Eliminar carácter de nueva línea
+                int fd = open(filename, O_RDONLY);
+                if (fd < 0) {
+                    perror("Error al abrir el archivo");
+                    strcpy(buffer, "Error al abrir el archivo");
+                    send(sockclifd, buffer, strlen(buffer), 0);
+                } else {
+                    int bytes_read;
+                    while ((bytes_read = read(fd, buffer, sizeof(buffer) - 1)) > 0) {
+                        buffer[bytes_read] = '\0';
+                        send(sockclifd, buffer, bytes_read, 0);
+                    }
+                    close(fd);
+                }
+                strcpy(buffer, "\nEND\n");  // Indicar el fin del archivo
+                send(sockclifd, buffer, strlen(buffer), 0);
+            } else if (buffer[0] == '3') {
+                // Modificar el contenido de un archivo
+                char *filename = buffer + 1;
+                char *content = strstr(buffer, "\n") + 1;
+                filename[strcspn(filename, "\n")] = '\0';  // Eliminar carácter de nueva línea
 
-void armarMensajeDirectorio(char *mensaje) {
-    memset(mensaje, '\0', LONGMENSAJE);
-    DIR *dir = opendir(".");
-    if (dir != NULL) {
-        struct dirent *midirent;
-        struct stat mistat;
-        while ((midirent = readdir(dir)) != NULL) {
-            printf("___Registro del directorio archivo_______\n");
-            printf("inodo %d\n", midirent->d_ino);   /* Inode number */
-            printf("largo registro %d\n", midirent->d_reclen); /*Length of this record */
-            printf("type %d\n", midirent->d_type);      /* Type of file; not supported */
-            printf("nombre %s\n", midirent->d_name);    /* Null-terminated filename */
-            printf("__________________________________\n");
-            if (stat(midirent->d_name, &mistat) != -1) {
-                printf("     __informacion del archivo___\n");
-                printf("     inode %d\n", mistat.st_ino); /* Inode number */
-                printf("     mode %d\n", mistat.st_mode);/* File type and mode */
-                printf("     links %d\n", mistat.st_nlink);/* Number of hard links */
-                printf("     uid %d\n", mistat.st_uid);  /* User ID of owner */
-                printf("     gid %d\n", mistat.st_gid);  /* Group ID of owner */
-                printf("     tamaÃ±o %ld\n", mistat.st_size); /* Total size, in bytes */
-                printf("     __________________________________\n");
+                // Leer el contenido actual del archivo
+                char old_content[MAX_BUFFER];
+                int fd = open(filename, O_RDWR);
+                if (fd < 0) {
+                    perror("Error al abrir el archivo");
+                    strcpy(buffer, "Error al abrir el archivo");
+                    send(sockclifd, buffer, strlen(buffer), 0);
+                } else {
+                    int bytes_read = read(fd, old_content, sizeof(old_content) - 1);
+                    old_content[bytes_read] = '\0';
+
+                    // Modificar el contenido del archivo basado en la solicitud del cliente
+                    char *line = strtok(content, "\n");
+                    while (line != NULL) {
+                        if (strstr(line, "agregar ") == line) {
+                            // Agregar jugador
+                            line += strlen("agregar ");
+                            strcat(old_content, line);
+                            strcat(old_content, "\n");
+                        } else if (strstr(line, "eliminar ") == line) {
+                            // Eliminar jugador
+                            line += strlen("eliminar ");
+                            char *pos = strstr(old_content, line);
+                            if (pos != NULL) {
+                                char *end_of_line = strstr(pos, "\n");
+                                if (end_of_line != NULL) {
+                                    memmove(pos, end_of_line + 1, strlen(end_of_line + 1) + 1);
+                                } else {
+                                    *pos = '\0';
+                                }
+                            }
+                        } else {
+                            // Modificar jugador
+                            char camiseta[64];
+                            int dorsal;
+                            sscanf(line, "%s %d", camiseta, &dorsal);
+                            char *pos = strstr(old_content, camiseta);
+                            if (pos != NULL) {
+                                char *end_of_line = strstr(pos, "\n");
+                                if (end_of_line != NULL) {
+                                    memmove(pos, end_of_line + 1, strlen(end_of_line + 1) + 1);
+                                } else {
+                                    *pos = '\0';
+                                }
+                                strcat(old_content, camiseta);
+                                strcat(old_content, " ");
+                                char dorsal_str[10];
+                                sprintf(dorsal_str, "%d", camiseta);
+                                strcat(old_content, dorsal_str);
+                                strcat(old_content, "\n");
+                            }
+                        }
+                        line = strtok(NULL, "\n");
+                    }
+
+                    // Escribir el contenido modificado en el archivo
+                    lseek(fd, 0, SEEK_SET);  // Volver al inicio del archivo
+                    ftruncate(fd, 0);  // Limpiar el archivo
+                    if (write(fd, old_content, strlen(old_content)) < 0) {
+                        perror("Error al escribir en el archivo");
+                        strcpy(buffer, "Error al escribir en el archivo");
+                        send(sockclifd, buffer, strlen(buffer), 0);
+                    } else {
+                        strcpy(buffer, "Archivo modificado con éxito");
+                        send(sockclifd, buffer, strlen(buffer), 0);
+                    }
+                    close(fd);
+                }
+                strcpy(buffer, "\nEND\n");  // Indicar el fin de la modificación
+                send(sockclifd, buffer, strlen(buffer), 0);
+            } else if (buffer[0] == '4') {
+                // Eliminar un archivo
+                char *filename = buffer + 1;
+                filename[strcspn(filename, "\n")] = '\0';  // Eliminar carácter de nueva línea
+
+                if (remove(filename) == 0) {
+                    strcpy(buffer, "Archivo eliminado con éxito");
+                } else {
+                    perror("Error al eliminar el archivo");
+                    strcpy(buffer, "Error al eliminar el archivo");
+                }
+                send(sockclifd, buffer, strlen(buffer), 0);
+                strcpy(buffer, "\nEND\n");  // Indicar el fin de la eliminación
+                send(sockclifd, buffer, strlen(buffer), 0);
+            } else if (buffer[0] == '5') {
+                // Crear un nuevo archivo con contenido
+                char *filename = buffer + 1;
+                char *content = strstr(buffer, "\n") + 1;
+                filename[strcspn(filename, "\n")] = '\0';  // Eliminar carácter de nueva línea
+
+                int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+                if (fd < 0) {
+                    perror("Error al crear el archivo");
+                    strcpy(buffer, "Error al crear el archivo");
+                    send(sockclifd, buffer, strlen(buffer), 0);
+                } else {
+                    if (write(fd, content, strlen(content)) < 0) {
+                        perror("Error al escribir en el archivo");
+                        strcpy(buffer, "Error al escribir en el archivo");
+                        send(sockclifd, buffer, strlen(buffer), 0);
+                    } else {
+                        strcpy(buffer, "Archivo creado con éxito");
+                        send(sockclifd, buffer, strlen(buffer), 0);
+                    }
+                    close(fd);
+                }
+                strcpy(buffer, "\nEND\n");  // Indicar el fin de la creación
+                send(sockclifd, buffer, strlen(buffer), 0);
+            } else if (buffer[0] == '9') {
+                // Cerrar la conexión con el cliente
+                strcpy(buffer, "Conexión cerrada");
+                send(sockclifd, buffer, strlen(buffer), 0);
+                break;
             }
-            char sizeArchivo[16];
-            memset(sizeArchivo, '\0', 16);
-            strcat(mensaje, midirent->d_name);
-            strcat(mensaje, " ");
-            sprintf(sizeArchivo, "%ld", mistat.st_size);
-            strcat(mensaje, sizeArchivo);
-            strcat(mensaje, "\n");
+        } else if (nb == 0) {
+            // El cliente cerró la conexión
+            printf("Cliente desconectado\n");
+            break;
+        } else {
+            // Error al recibir mensaje
+            perror("Error al recibir el mensaje");
+            break;
         }
-        strcat(mensaje, "\0");
-        closedir(dir);
+        memset(buffer, 0, sizeof(buffer));  // Limpiar el buffer para la próxima solicitud
     }
+
+    close(sockclifd);
+    return NULL;
 }
-
-void armarMensajeContenidoArchivo(char *mensaje) {
-    int i, j;
-    char *nombreArchivo, *dir;
-    nombreArchivo = (char *)malloc(64);
-    dir = nombreArchivo;
-    j = 0;
-    for (i = 1; mensaje[i] != '\0' && mensaje[i] != '\n'; i++) {
-        *dir = mensaje[i];
-        dir++;
-    }
-    *dir = '\0';
-    memset(mensaje, '\0', LONGMENSAJE);
-    struct stat mistat;
-    if (stat(nombreArchivo, &mistat) != -1) {
-        int fd = open(nombreArchivo, O_RDONLY);
-        int nb = read(fd, mensaje, mistat.st_size);
-        mensaje[nb] = '\0';
-        close(fd);
-    }
-    free(nombreArchivo);
-}
-
-void armarMensajeCierreConexion(char *mensaje) {
-    memset(mensaje, '\0', LONGMENSAJE);
-    strcat(mensaje, "chau cliente\0");
-}
-
-void agregarArchivo(char *mensaje) {
-    char *nombreArchivo = mensaje + 1; // El nombre del archivo comienza desde el segundo caracter
-    FILE *archivo = fopen(nombreArchivo, "w");
-    if (archivo != NULL) {
-        fclose(archivo);
-        sprintf(mensaje, "Archivo %s creado exitosamente", nombreArchivo);
-    } else {
-        perror("Error al crear archivo"); // Imprimir error detallado
-        sprintf(mensaje, "No se pudo crear el archivo %s", nombreArchivo);
-    }
-}
-
-void borrarArchivo(char *mensaje) {
-    char *nombreArchivo = mensaje + 1; // El nombre del archivo comienza desde el segundo caracter
-    int resultado = remove(nombreArchivo);
-    if (resultado == 0) {
-        printf("Archivo borrado exitosamente: %s\n", nombreArchivo);
-        strcpy(mensaje, "Archivo borrado exitosamente");
-    } else {
-        printf("No se pudo borrar el archivo: %s\n", nombreArchivo);
-        strcpy(mensaje, "No se pudo borrar el archivo");
-    }
-}
-
-void modificarArchivo(char *mensaje, int sockcli) {
-    printf("Antes de while");
-    char *nombreArchivo = mensaje + 1; // El nombre del archivo comienza desde el segundo caracter
-    char contenidoNuevo[LONGMENSAJE];
-    int nb, fd, nbytes;
-
-    // Abrir el archivo en modo de escritura
-    fd = open(nombreArchivo, O_WRONLY | O_TRUNC);
-    if (fd == -1) {
-        // Si no se pudo abrir el archivo, envÃ­a un mensaje de error al cliente
-        strcpy(mensaje, "No se pudo abrir el archivo para modificarlo");
-        send(sockcli, mensaje, strlen(mensaje), 0);
-        return;
-    }
-    
-    printf("Antes de while");
-    strcpy(mensaje, "Archivo abierto con exito");
-    send(sockcli, mensaje, strlen(mensaje), 0);
-
-    // Recibir el nuevo contenido del archivo del cliente
-    memset(contenidoNuevo, '\0', LONGMENSAJE);
-    printf("Antes de while");
-    while ((nb = recv(sockcli, contenidoNuevo, LONGMENSAJE, 0)) > 0) {
-        printf("Contenido recibido");
-        // Escribir el contenido recibido en el archivo
-        nbytes = write(fd, contenidoNuevo, nb);
-        if (nbytes == -1) {
-            // Si hubo un error al escribir en el archivo, envÃ­a un mensaje de error al cliente
-            strcpy(mensaje, "Error al escribir en el archivo");
-            close(fd);
-            send(sockcli, mensaje, strlen(mensaje), 0);
-            return;
-        }
-    }
-
-    // Cerrar el archivo
-    close(fd);
-
-    // Enviar mensaje de confirmaciÃ³n al cliente
-    strcpy(mensaje, "Archivo modificado exitosamente");
-    send(sockcli, mensaje, strlen(mensaje), 0);
-}
-
