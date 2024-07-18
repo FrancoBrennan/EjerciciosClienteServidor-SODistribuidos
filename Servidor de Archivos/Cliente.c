@@ -7,6 +7,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <stdbool.h>
 
 #define LONGMENSAJE 8*1024
 
@@ -17,6 +18,8 @@ void eliminaArchivo(int sockclifd);
 void creaArchivo(int sockclifd);
 void cierraConexion(int sockclifd);
 int menu(void);
+
+bool EstaLleno(sockclifd);
 
 int main(int argc, char *argv[]) {
     if (argc != 3) {
@@ -44,6 +47,13 @@ int main(int argc, char *argv[]) {
         perror("Error en connect");
         close(sockclifd);
         exit(EXIT_FAILURE);
+    }
+    
+    if(EstaLleno(sockclifd)){
+    	cierraConexion(sockclifd);
+    	close(sockclifd);
+    	
+    	return(0);
     }
 
     printf("Cliente conectado con el servidor\n");
@@ -73,6 +83,25 @@ int main(int argc, char *argv[]) {
     cierraConexion(sockclifd);
     close(sockclifd);
     return 0;
+}
+
+bool EstaLleno(int sockclifd)
+{
+    char mensaje[LONGMENSAJE];
+    int nb = recv(sockclifd, mensaje, LONGMENSAJE, 0);
+    if (nb > 0)
+    {
+        mensaje[nb] = '\0';
+        if (strcmp(mensaje, "Servidor lleno, por favor intente más tarde.") == 0)
+        {
+            printf("Error: %s\n", mensaje);
+            return true;
+        }
+        
+        printf(mensaje,"\n");
+        return false;
+        
+    }
 }
 
 // Solicitar y mostrar el listado de archivos en el directorio del servidor
